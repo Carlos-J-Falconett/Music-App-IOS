@@ -24,10 +24,37 @@ nonisolated enum LibraryImporter {
     @concurrent
     static func importItems(_ urls: [URL], existing: Set<String>) async -> [ImportedTrack] {
         let copied = urls.flatMap { copyIntoLibrary($0) }
+        return await read(copied.filter { !existing.contains($0) })
+    }
+
+    /// Indexes files that are already inside `musicDirectory` (server downloads): the same
+    /// per-file steps as importing, without copying anything.
+    @concurrent
+    static func indexInPlace(relativePaths: [String], existing: Set<String>) async -> [ImportedTrack] {
+        await read(relativePaths.filter { !existing.contains($0) })
+    }
+
+    /// Relative paths of every audio file in `musicDirectory` (not `.part` downloads).
+    @concurrent
+    static func audioFilesInLibraryFolder() async -> [String] {
+        let root = LibraryLocations.musicDirectory.resolvingSymlinksInPath()
+        let rootComponents = root.pathComponents.count
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: [.isRegularFileKey],
+                                                              options: [.skipsHiddenFiles]) else { return [] }
+        var paths: [String] = []
+        while let file = enumerator.nextObject() as? URL {
+            guard audioExtensions.contains(file.pathExtension.lowercased()) else { continue }
+            paths.append(file.resolvingSymlinksInPath().pathComponents.dropFirst(rootComponents).joined(separator: "/"))
+        }
+        return paths.sorted()
+    }
+
+    /// Reads tags, cover art (embedded, else a folder image, checked once per folder) and
+    /// the audio format of files in `musicDirectory`.
+    private static func read(_ relativePaths: [String]) async -> [ImportedTrack] {
         var results: [ImportedTrack] = []
         var folderCovers: [String: String?] = [:]
-
-        for relativePath in copied where !existing.contains(relativePath) {
+        for relativePath in relativePaths {
             let fileURL = LibraryLocations.musicDirectory.appending(path: relativePath)
             var metadata = await TagReader.read(url: fileURL, relativePath: relativePath)
             var coverKey: String?
@@ -120,6 +147,12 @@ enum LibraryActions {
     static func importFiles(_ urls: [URL], into context: ModelContext) async -> Int {
         let existing = Set(((try? context.fetch(FetchDescriptor<Track>())) ?? []).map(\.relativePath))
         let imported = await LibraryImporter.importItems(urls, existing: existing)
+        insert(imported, into: context)
+        return imported.count
+    }
+
+    /// Adds imported (or downloaded) files to the library and saves.
+    static func insert(_ imported: [ImportedTrack], into context: ModelContext) {
         for item in imported {
             let meta = item.metadata
             let track = Track(
@@ -138,7 +171,6 @@ enum LibraryActions {
             context.insert(track)
         }
         try? context.save()
-        return imported.count
     }
 
     /// Fills in the Album Artist for songs imported before it was saved (`albumArtist == nil`).

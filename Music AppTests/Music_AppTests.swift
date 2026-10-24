@@ -1465,3 +1465,224 @@ struct DuplicateTests {
         #expect(store.keptCopy == [lossy.id: lossless.id])
     }
 }
+
+/// A pretend media server for the sync tests (no network, made-up token).
+final class MediaServerStub: URLProtocol {
+    struct Request: Sendable { let path: String; let query: String; let authorization: String?; let range: String? }
+
+    nonisolated(unsafe) static var libraries = "[]"
+    /// since → page JSON
+    nonisolated(unsafe) static var pages: [Int: String] = [:]
+    /// item id → file bytes
+    nonisolated(unsafe) static var files: [String: Data] = [:]
+    /// Answer every request with this status (e.g. 401).
+    nonisolated(unsafe) static var forcedStatus: Int?
+    /// Ignore Range headers (send the whole file with 200).
+    nonisolated(unsafe) static var ignoreRange = false
+    nonisolated(unsafe) static var requests: [Request] = []
+
+    static func reset() {
+        libraries = "[]"; pages = [:]; files = [:]; forcedStatus = nil; ignoreRange = false; requests = []
+    }
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        let url = request.url!
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let range = request.value(forHTTPHeaderField: "Range")
+        Self.requests.append(Request(path: url.path, query: url.query ?? "",
+                                     authorization: request.value(forHTTPHeaderField: "Authorization"), range: range))
+        var status = 200
+        var body = Data()
+        var headers: [String: String] = [:]
+        if let forced = Self.forcedStatus {
+            status = forced
+        } else if url.path == "/api/health" {
+            body = Data(#"{"status":"ok"}"#.utf8)
+        } else if url.path == "/api/libraries" {
+            body = Data(Self.libraries.utf8)
+        } else if url.path == "/api/items" {
+            let since = Int(components?.queryItems?.first { $0.name == "since" }?.value ?? "0") ?? 0
+            body = Data((Self.pages[since] ?? #"{"items":[],"next_since":0,"more":false}"#).utf8)
+        } else if url.path.hasSuffix("/file"), let file = Self.files[url.deletingLastPathComponent().lastPathComponent] {
+            if let range, !Self.ignoreRange, let start = Int(range.dropFirst("bytes=".count).dropLast()) {
+                status = 206
+                body = file.subdata(in: start..<file.count)
+                headers["Content-Range"] = "bytes \(start)-\(file.count - 1)/\(file.count)"
+            } else {
+                body = file
+            }
+        } else {
+            status = 404
+        }
+        let response = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
+        client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+        client?.urlProtocol(self, didLoad: body)
+        client?.urlProtocolDidFinishLoading(self)
+    }
+
+    override func stopLoading() {}
+}
+
+@Suite(.serialized) @MainActor
+struct MediaServerSyncTests {
+    private let token = "test-token-not-real"
+
+    private func client() -> MediaServerClient {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [MediaServerStub.self]
+        return MediaServerClient(baseURL: URL(string: "https://media.example")!, token: token,
+                                 session: URLSession(configuration: configuration))
+    }
+
+    private func itemJSON(id: String, library: String, path: String, size: Int, deleted: Bool = false, kind: String = "audio", seq: Int) -> String {
+        #"{"id":"\#(id)","key":"\#(library):\#(path)","library":"\#(library)","rel_path":"\#(path)","kind":"\#(kind)","size":\#(size),"mtime":1792304674.0,"deleted":\#(deleted),"seq":\#(seq),"meta":{"title":"\#(id)","artist":"Server Artist","duration":1.0,"codec":"pcm"}}"#
+    }
+
+    private func audio(seconds: Double) throws -> Data {
+        let url = FileManager.default.temporaryDirectory.appending(path: "server-\(UUID().uuidString).caf")
+        try AudioFixtures.writeTone(to: url, seconds: seconds)
+        return try Data(contentsOf: url)
+    }
+
+    private func container() throws -> ModelContainer {
+        try ModelContainer(for: Track.self, configurations: ModelConfiguration(isStoredInMemoryOnly: true))
+    }
+
+    @Test func addressesAreNormalized() {
+        #expect(MediaServerClient.normalizedURL("media.example")?.absoluteString == "https://media.example")
+        #expect(MediaServerClient.normalizedURL(" https://media.example/ ")?.absoluteString == "https://media.example")
+        #expect(MediaServerClient.normalizedURL("") == nil)
+        #expect(ServerSyncStore.localPrefix(for: "music") == "")
+        #expect(ServerSyncStore.localPrefix(for: "hires") == "Hi-Res/")
+    }
+
+    @Test func syncDownloadsPagesIntoTheLibraryAndSavesTheCursor() async throws {
+        MediaServerStub.reset()
+        let library = "audio-\(UUID().uuidString.prefix(8))"
+        defer { try? FileManager.default.removeItem(at: LibraryLocations.musicDirectory.appending(path: library)) }
+        let first = try audio(seconds: 1), second = try audio(seconds: 2)
+        MediaServerStub.files = ["a1": first, "a2": second]
+        MediaServerStub.libraries = #"[{"name":"\#(library)","kind":"audio","count":3,"available":true},{"name":"books","kind":"book","count":9,"available":true}]"#
+        MediaServerStub.pages = [
+            0: #"{"items":[\#(itemJSON(id: "a1", library: library, path: "Artist/Album/01 One.caf", size: first.count, seq: 1)),\#(itemJSON(id: "b1", library: library, path: "Artist/Album/cover.jpg", size: 10, kind: "file", seq: 2))],"next_since":2,"more":true}"#,
+            2: #"{"items":[\#(itemJSON(id: "a2", library: library, path: "Artist/Album/02 Two.caf", size: second.count, seq: 3)),\#(itemJSON(id: "gone", library: library, path: "Artist/Old.caf", size: 5, deleted: true, seq: 4))],"next_since":4,"more":false}"#,
+        ]
+        let defaults = UserDefaults(suiteName: "server-sync-\(UUID().uuidString)")!
+        let store = ServerSyncStore(defaults: defaults)
+        let container = try container()
+        await store.run(client: client(), context: container.mainContext)
+
+        #expect(store.lastError == nil)
+        #expect(store.lastSummary?.downloaded == 2)
+        // Only this test's songs (the sync also adds any other leftover files on the simulator).
+        let tracks = try container.mainContext.fetch(FetchDescriptor<Track>()).filter { $0.relativePath.hasPrefix(library) }
+        #expect(Set(tracks.map(\.relativePath)) == ["\(library)/Artist/Album/01 One.caf", "\(library)/Artist/Album/02 Two.caf"])
+        #expect(tracks.allSatisfy { $0.serverKey?.hasPrefix("\(library):") == true && $0.serverID != nil })
+        #expect(defaults.integer(forKey: ServerSyncStore.cursorKey(library)) == 4)
+        // Every request but the health check carries the token; the books library isn't touched.
+        #expect(MediaServerStub.requests.allSatisfy { $0.authorization == "Bearer \(token)" })
+        #expect(!MediaServerStub.requests.contains { $0.query.contains("library=books") })
+
+        // A second sync finds nothing new: same sizes on disk, so nothing is downloaded again.
+        MediaServerStub.pages = [4: #"{"items":[],"next_since":4,"more":false}"#]
+        await store.run(client: client(), context: container.mainContext)
+        #expect(store.lastSummary?.downloaded == 0)
+    }
+
+    @Test func interruptedDownloadsResumeWithARange() async throws {
+        MediaServerStub.reset()
+        let file = try audio(seconds: 1)
+        MediaServerStub.files = ["r1": file]
+        let item = ServerItem(id: "r1", key: "music:Song.caf", library: "music", relPath: "Song.caf", kind: "audio",
+                              size: Int64(file.count), mtime: 1_792_304_674, deleted: false, seq: 1, meta: ItemMeta())
+        let destination = FileManager.default.temporaryDirectory.appending(path: "resume-\(UUID().uuidString)/Song.caf")
+        let part = destination.deletingLastPathComponent().appending(path: "Song.caf.part")
+        try FileManager.default.createDirectory(at: part.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try file.prefix(1000).write(to: part)
+
+        try await client().download(item, to: destination)
+        #expect(MediaServerStub.requests.last?.range == "bytes=1000-")
+        #expect(try Data(contentsOf: destination) == file)
+        #expect(!FileManager.default.fileExists(atPath: part.path))
+
+        // A server that ignores the range (200) starts the file over instead of appending.
+        MediaServerStub.ignoreRange = true
+        try? FileManager.default.removeItem(at: destination)
+        try file.prefix(500).write(to: part)
+        try await client().download(item, to: destination)
+        #expect(try Data(contentsOf: destination) == file)
+    }
+
+    @Test func aRejectedTokenStopsWithoutMovingTheCursor() async throws {
+        MediaServerStub.reset()
+        MediaServerStub.forcedStatus = 401
+        let defaults = UserDefaults(suiteName: "server-sync-\(UUID().uuidString)")!
+        let store = ServerSyncStore(defaults: defaults)
+        let container = try container()
+        await store.run(client: client(), context: container.mainContext)
+        #expect(store.lastError == MediaServerError.unauthorized.errorDescription)
+        #expect(defaults.object(forKey: ServerSyncStore.cursorKey("music")) == nil)
+        MediaServerStub.forcedStatus = 502
+        await store.run(client: client(), context: container.mainContext)
+        #expect(store.lastError == MediaServerError.serverClosed.errorDescription)
+    }
+
+    @Test func librariesOnAnUnpluggedDriveAreSkipped() async throws {
+        MediaServerStub.reset()
+        MediaServerStub.libraries = #"{"libraries":[{"name":"hires","kind":"audio","count":10,"available":false}]}"#
+        let store = ServerSyncStore(defaults: UserDefaults(suiteName: "server-sync-\(UUID().uuidString)")!)
+        let container = try container()   // kept alive while the sync uses its context
+        await store.run(client: client(), context: container.mainContext)
+        #expect(store.lastSummary?.unavailable == ["hires"])
+        #expect(!MediaServerStub.requests.contains { $0.path == "/api/items" })
+    }
+
+    @Test func songsFinishedBeforeASyncStopsAreKept() async throws {
+        MediaServerStub.reset()
+        let library = "audio-\(UUID().uuidString.prefix(8))"
+        defer { try? FileManager.default.removeItem(at: LibraryLocations.musicDirectory.appending(path: library)) }
+        let first = try audio(seconds: 1)
+        // The second song's file isn't on the server, so its download fails mid-page.
+        MediaServerStub.files = ["k1": first]
+        MediaServerStub.libraries = #"[{"name":"\#(library)","kind":"audio","count":2,"available":true}]"#
+        MediaServerStub.pages = [0: #"{"items":[\#(itemJSON(id: "k1", library: library, path: "A/B/01 Kept.caf", size: first.count, seq: 1)),\#(itemJSON(id: "k2", library: library, path: "A/B/02 Missing.caf", size: 999, seq: 2))],"next_since":2,"more":false}"#]
+        let defaults = UserDefaults(suiteName: "server-sync-\(UUID().uuidString)")!
+        let store = ServerSyncStore(defaults: defaults)
+        let container = try container()
+        await store.run(client: client(), context: container.mainContext)
+
+        #expect(store.lastError != nil)
+        // The song that finished is in the library, but the page isn't marked done.
+        let tracks = try container.mainContext.fetch(FetchDescriptor<Track>()).filter { $0.relativePath.hasPrefix(library) }
+        #expect(tracks.map(\.relativePath) == ["\(library)/A/B/01 Kept.caf"])
+        #expect(defaults.integer(forKey: ServerSyncStore.cursorKey(library)) == 0)
+    }
+
+    @Test func leftoverDownloadsAreAddedButPartFilesAreNot() async throws {
+        let folder = "leftover-\(UUID().uuidString.prefix(8))"
+        let root = LibraryLocations.musicDirectory.appending(path: folder)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try AudioFixtures.writeTone(to: root.appending(path: "Artist/Album/01 Done.caf"), seconds: 1)
+        try Data(count: 100).write(to: root.appending(path: "Artist/Album/02 Half.caf.part"))
+        let container = try container()
+        let added = await LibraryActions.addMissingFiles(into: container.mainContext)
+        let paths = try container.mainContext.fetch(FetchDescriptor<Track>()).map(\.relativePath)
+        #expect(paths.contains("\(folder)/Artist/Album/01 Done.caf"))
+        #expect(!paths.contains { $0.hasSuffix(".part") })
+        #expect(added >= 1)
+        // Running it again adds nothing new.
+        #expect(await LibraryActions.addMissingFiles(into: container.mainContext) == 0)
+    }
+
+    @Test func tokenIsKeptInTheKeychain() {
+        let previous = ServerTokenStore.token
+        defer { if let previous { ServerTokenStore.save(previous) } else { ServerTokenStore.remove() } }
+        #expect(ServerTokenStore.save("  \(token)\n"))
+        #expect(ServerTokenStore.token == token)   // pasted spaces and line breaks removed
+        ServerTokenStore.remove()
+        #expect(!ServerTokenStore.hasToken)
+    }
+}

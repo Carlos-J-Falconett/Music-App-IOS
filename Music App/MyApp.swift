@@ -10,6 +10,7 @@ import SwiftData
     @State private var libraryIndex = LibraryIndexStore()
     @State private var listeningTotals = ListeningTotalsStore()
     @State private var lyrics: LyricsStore
+    @State private var serverSync = ServerSyncStore()
     @Environment(\.scenePhase) private var scenePhase
 
     init() {
@@ -46,6 +47,7 @@ import SwiftData
                 .environment(libraryIndex)
                 .environment(listeningTotals)
                 .environment(lyrics)
+                .environment(serverSync)
                 .environment(player)
                 .environment(theme)
                 .environment(appState)
@@ -63,6 +65,13 @@ import SwiftData
                     await LibraryActions.backfillAlbumArtists(in: container.mainContext)
                     // One-time: read the audio format of songs imported before it was saved.
                     await LibraryActions.backfillAudioFormats(in: container.mainContext)
+                    // Songs an interrupted server sync downloaded but hadn't added yet.
+                    await LibraryActions.addMissingFiles(into: container.mainContext)
+                    // Optional (Settings → Media Server → Sync When Sun Opens).
+                    if UserDefaults.standard.bool(forKey: ServerSyncStore.syncOnLaunchKey) {
+                        let address = UserDefaults.standard.string(forKey: ServerSyncStore.addressKey) ?? ""
+                        serverSync.start(client: MediaServerClient.configured(address: address), context: container.mainContext)
+                    }
                     // One-time: artists have one image again; fold in any separate backgrounds.
                     ArtistArtwork.mergeLegacyBackgrounds(in: container.mainContext)
                 }

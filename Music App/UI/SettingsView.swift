@@ -1,7 +1,8 @@
 import SwiftUI
 import SwiftData
 
-/// Settings tab: a Library card (song count, Add Music), then grouped rows with
+/// Settings tab: a Library card (song count, Sync Music from the media server), Import
+/// from Files, then grouped rows with
 /// colored icon tiles for the theme, Now Playing options, lyrics, duplicates and Playback Problems.
 struct SettingsView: View {
     @Environment(AppState.self) private var appState
@@ -11,6 +12,11 @@ struct SettingsView: View {
     @AppStorage(PreferenceKeys.nowPlayingShowsCover) private var showsCover = false
     @Environment(LibraryIndexStore.self) private var library
     @Environment(MusicPlayer.self) private var player
+    @Environment(ServerSyncStore.self) private var sync
+    @Environment(\.modelContext) private var context
+    @AppStorage(ServerSyncStore.addressKey) private var serverAddress = ""
+    /// Opens Media Server when Sync Music is tapped before the server is set up.
+    @State private var showServerSetup = false
 
     var body: some View {
         Form {
@@ -18,6 +24,18 @@ struct SettingsView: View {
                 libraryCard
                     .listRowBackground(Color.clear)
                     .listRowInsets(EdgeInsets())
+            } footer: {
+                Text("Sync Music downloads new music from your media server (set it up in Media Server below).")
+                    .settingsFooter()
+            }
+
+            Section {
+                Button {
+                    appState.showImporter = true
+                } label: {
+                    SettingsRowLabel(title: "Import from Files", systemImage: "folder.fill.badge.plus", tile: theme.accent)
+                }
+                .settingsRow()
             } footer: {
                 Text("Pick songs or whole folders in the Files app. The app keeps its own copy, so your originals are never changed.")
                     .settingsFooter()
@@ -45,6 +63,8 @@ struct SettingsView: View {
                     .settingsFooter()
             }
 
+            MediaServerSettingsSection()
+
             LyricsSettingsSection()
 
             DuplicatesSettingsSection()
@@ -66,10 +86,55 @@ struct SettingsView: View {
         }
         .foregroundStyle(theme.text)
         .navigationTitle("Settings")
+        .navigationDestination(isPresented: $showServerSetup) { MediaServerSettingsView() }
         .backdropScreen()
     }
 
-    /// Song count (and hidden artists) with a glowing Add Music button.
+    private var serverIsSetUp: Bool {
+        MediaServerClient.normalizedURL(serverAddress) != nil && ServerTokenStore.hasToken
+    }
+
+    /// Syncs with the media server, or opens Media Server to set it up first.
+    private func syncMusic() {
+        if let client = MediaServerClient.configured(address: serverAddress) {
+            sync.start(client: client, context: context)
+        } else {
+            showServerSetup = true
+        }
+    }
+
+    /// While syncing: progress; afterwards: the result or the problem.
+    @ViewBuilder
+    private var syncStatus: some View {
+        if let progress = sync.progress {
+            HStack(spacing: 8) {
+                ProgressView()
+                    .tint(theme.text)
+                Text(progress.current.map { "Downloading \($0)" }
+                     ?? "Checking \(progress.checked)\(progress.total > 0 ? " of \(progress.total)" : "") songs")
+                    .lineLimit(1)
+                Spacer(minLength: 4)
+                Text("\(progress.downloaded) new")
+                    .monospacedDigit()
+            }
+            .font(.subheadline)
+            .foregroundStyle(theme.secondaryText)
+        } else if let error = sync.lastError {
+            Label(error, systemImage: "exclamationmark.triangle.fill")
+                .font(.subheadline)
+                .foregroundStyle(theme.secondaryText)
+        } else if let summary = sync.lastSummary {
+            Text(summary.cancelled
+                 ? "Sync stopped · \(summary.added) songs added"
+                 : summary.added == 0 && summary.updated == 0
+                    ? "Up to date with the server"
+                    : "Synced · \(countLabel(summary.added, "new song"))\(summary.updated > 0 ? " · \(summary.updated) updated" : "")")
+                .font(.subheadline)
+                .foregroundStyle(theme.secondaryText)
+        }
+    }
+
+    /// Song count (and hidden artists) with a glowing Sync Music button.
     private var libraryCard: some View {
         VStack(alignment: .leading, spacing: 14) {
             HStack(alignment: .firstTextBaseline) {
@@ -100,9 +165,16 @@ struct SettingsView: View {
                 }
                 Spacer()
             }
-            GlowCapsuleButton(title: "Add Music", systemImage: "plus", prominent: true) {
-                appState.showImporter = true
+            if sync.isSyncing {
+                GlowCapsuleButton(title: "Stop Sync", systemImage: "stop.fill", prominent: false) {
+                    sync.cancel()
+                }
+            } else {
+                GlowCapsuleButton(title: serverIsSetUp ? "Sync Music" : "Set Up Sync", systemImage: "arrow.down.circle", prominent: true) {
+                    syncMusic()
+                }
             }
+            syncStatus
         }
         .padding(18)
         .legibleOnGlass()
@@ -148,6 +220,11 @@ struct SettingsRowLabel: View {
 /// The Playback Problems log: newest first, with what failed and whether a retry fixed it.
 struct PlaybackProblemsView: View {
     @Environment(MusicPlayer.self) private var player
+    @Environment(ServerSyncStore.self) private var sync
+    @Environment(\.modelContext) private var context
+    @AppStorage(ServerSyncStore.addressKey) private var serverAddress = ""
+    /// Opens Media Server when Sync Music is tapped before the server is set up.
+    @State private var showServerSetup = false
     @Environment(ThemeStore.self) private var theme
 
     var body: some View {

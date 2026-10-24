@@ -6,6 +6,7 @@ An iPhone version of the [Sun desktop music player](https://github.com/Carlos-J-
 
 ### Library
 - **Importing:** tap **+** and pick songs or whole folders in the Files app (MP3, M4A/AAC/ALAC, FLAC, WAV, AIFF, CAF).
+  - **In the Files app:** the app's own storage shows as **On My iPhone → Sun** (`UIFileSharingEnabled`, `LSSupportsOpeningDocumentsInPlace`), with imported and downloaded songs in its `Music` folder. Deleting a file there leaves the song in the library but it can't play (it's skipped).
   - The app copies files into its own storage and never changes your originals.
   - Folder structure is kept, and files already in the library are skipped.
 - **Tags:** read with AVFoundation. Files without tags take their names from their folders (`Artist/Album/Song.ext`), and a leading track number like `01 - ` is removed from the title.
@@ -38,7 +39,7 @@ An iPhone version of the [Sun desktop music player](https://github.com/Carlos-J-
     - **Genres:** a grid of cover cards.
     - **Playlists:** a grid of cover cards with Favorites first (a heart). Long-press a playlist to delete it, since a grid has no swipe-to-delete.
   - **Stats** (see Stats below).
-  - **Settings** (`UI/SettingsView.swift`): a **Library** card at the top with the song count (and hidden artists, which explains why All Songs shows fewer songs) and a glowing **Add Music** button. Below it, grouped rows with colored icon tiles like the system Settings app (`SettingsRowLabel`): **Theme**, **Show Album Cover** for Now Playing, **Lyrics** (see Lyrics below), **Duplicates** (see Lossless and duplicates below), and **Playback Problems**. The Library card also says how many duplicate copies are hidden (counted apart from hidden artists' songs, so the numbers add up). The tiles use the theme's Primary, Secondary and Highlight colors, with a black or white symbol by the 3:1 contrast rule, and grow with the text size.
+  - **Settings** (`UI/SettingsView.swift`): a **Library** card at the top with the song count (and hidden artists, which explains why All Songs shows fewer songs) and a glowing **Sync Music** button: it syncs with the media server (see Media Server below), shows progress and the result in the card, and turns into **Stop Sync** while running. Before the server is set up it reads **Set Up Sync** and opens Settings → Media Server. Adding songs from the phone is the **Import from Files** row right under the card (songs or whole folders, copied into the app). Below it, grouped rows with colored icon tiles like the system Settings app (`SettingsRowLabel`): **Theme**, **Show Album Cover** for Now Playing, **Media Server** (see Media Server below), **Lyrics** (see Lyrics below), **Duplicates** (see Lossless and duplicates below), and **Playback Problems**. The Library card also says how many duplicate copies are hidden (counted apart from hidden artists' songs, so the numbers add up). The tiles use the theme's Primary, Secondary and Highlight colors, with a black or white symbol by the 3:1 contrast rule, and grow with the text size.
 - **Search** is a tab (`Tab(role: .search)`), always one tap away. The field is always shown under the title, and it searches artists, albums, songs and genres. Results open artist and album pages inside the tab, and going back keeps your search.
   - On this iOS version the search tab is drawn inside the tab bar rather than as a separate round button, even with the field on the tab view, so the field lives on the Search page.
 - **Artist credits** (`Library/ArtistCredits.swift`): songs with several artists are listed under each of them.
@@ -162,6 +163,26 @@ Shared values live in `UI/Components/Styling.swift`, so every screen lines up th
   - **Settings → Playback Problems** keeps the last 50 problems, with song, file, time, reason, whether the app was in the background, and whether the retry fixed it (`PlaybackIssueLog`).
   - **Ruled out:** a check on the phone showed all 1,587 files use the normal file protection, so locked-screen playback can read them.
 
+### Media Server (downloading music from home)
+Sun can download music from a personal media server running on a PC at home, reached through **Tailscale** over HTTPS (so no App Transport Security exceptions or Local Network permission are needed). The server says what exists and what changed; the phone keeps its own copy, so everything plays offline.
+- **Settings → Media Server** (`UI/MediaServerSettings.swift`):
+  - **Server Address:** the server's Tailscale address (`https://<pc>.<tailnet>.ts.net`). Saved as a setting; there's no default in the code. Tailscale must be connected on the iPhone (VPN On Demand in the Tailscale app keeps it connected).
+  - **Device Token:** this iPhone's token from the server's `config.toml`. It's pasted once and stored **only in the iOS Keychain** (`ServerTokenStore`, readable after first unlock); it's never shown again and never written to the source, Info.plist, UserDefaults or files. Replace Token / Remove Token are there if it changes.
+  - **Test Connection:** checks `/api/health` first (no token, so "can't reach the server" and "wrong token" are told apart), then lists the server's music libraries with their song counts, each with a switch to include it in syncs. A library on a drive that isn't plugged into the PC shows "Drive not connected".
+  - **Sync Now** with progress (songs checked of the library's total, songs downloaded, the song downloading now with its own bar) and **Stop**; afterwards a summary ("Synced 9:41 PM · 12 downloaded · 12 new in your library"). **Sync When Sun Opens** (off by default) runs it at launch.
+  - Clear messages: a 401 means the token was rejected, a 502 means the server isn't running on the PC, and no connection means Tailscale isn't connected.
+- **How a sync works** (`Sources/ServerSync.swift`, the server guide's algorithm): for each music library, read the change feed from the saved cursor (500 items a page); download each song that's missing on the phone or a different size; add the page's new songs to the library; then save the cursor, so a crash or Stop just repeats that page.
+  - **Where files go:** `Documents/Music/<rel_path>`, the same `Artist/Album/Song` layout as imported music. The High-Res library goes into `Documents/Music/Hi-Res/` so its copies never overwrite the regular ones; Settings → Duplicates then decides which copy shows (Lossless keeps the hi-res one).
+  - **Resumable downloads** (`PartFileDownload`): files stream into `<file>.part` as they arrive. After an interruption the next sync sends `Range: bytes=<part size>-`: a 206 reply appends, a 200 reply starts over. The finished file keeps the server's modification date.
+  - **Added as they download:** every 10 songs (or 20 seconds), not only at the end of a 500-item page, so a sync that's stopped or interrupted keeps the songs it finished. Before each sync and at launch, any song file in `Documents/Music` that isn't in the library yet (left by an interrupted sync) is added too (`LibraryActions.addMissingFiles`); unfinished `.part` files are left to resume.
+  - **Adding to the library:** downloaded files go through the same steps as importing (`LibraryImporter.indexInPlace`: tags, embedded or folder cover, audio format), so artists, albums, duplicates and Lossless Only work the same. If the file has no cover, the server's (`/api/items/{id}/cover`) is used. A newer version of a song already in the library updates it in place. Files already on the phone but not yet in the library (e.g. the app closed mid-sync) are added too.
+  - Each downloaded song remembers its server id and key (`Track.serverID`, `Track.serverKey` = "library:rel_path"), the cross-device identity for syncing stats, favorites and playlists later.
+  - **Songs from the Server** (in Media Server) lists every downloaded song, with how many are shown in place of a copy you already had. A server FLAC of a song you had as an MP3 doesn't appear as a new song: Duplicates shows the FLAC in the MP3's place.
+  - **Songs removed on the server are never deleted from the phone.**
+  - A big first sync should run with the app open: iOS gives a little extra time after leaving (`beginBackgroundTask`), then pauses it; the next sync continues from the cursor and any part-downloaded file.
+- **Client** (`Sources/MediaServerClient.swift`): `MediaServerClient` (health, libraries, the item change feed, covers, resumable downloads; Bearer token on every request except health), and `LocalServerSongSource`, the server as a `SongSource` (lists songs not downloaded yet). Streaming isn't wired up: the player plays files on the phone.
+- **Not wired yet:** syncing listening stats, favorites and playlists through the server (the server supports it; it's the next step).
+
 ### Lossless and duplicates
 - **Audio format** (`Library/AudioFormat.swift`): each song's codec (FLAC, ALAC, uncompressed, AAC, MP3, Opus), sample rate, bit depth (lossless files) and average bitrate are read from the file header when it's imported, and saved on the song (`Track.codec`, `sampleRate`, `bitDepth`, `bitRate`). Songs imported earlier get theirs once, in the background at launch (`LibraryActions.backfillAudioFormats`). Until then, the file extension decides (".m4a" counts as lossy, since it can be either).
 - **Duplicates** (`Library/Duplicates.swift`): a song is in the library more than once when the title (ignoring case, accents and extra spaces) and main artist match and the lengths are within 3 seconds. So a single and its album version match; live versions and remixes don't; songs with an unknown length are never matched.
@@ -200,7 +221,7 @@ Ported from the desktop app (`lyrics.py`, `lyrics_view.py`, `lyrics_manager.py`)
 - `LyricsProvider` (lyrics for a `LyricsQuery`: found, instrumental, or not found, certain or not; throwing means "couldn't check"), `SongSource` (list `RemoteSong`s and give a URL to stream or download one), `ArtistImageSource` (image data for an artist).
 - `MediaSources` holds them in the order they're asked. Today: `[EmbeddedLyricsProvider, LRCLIBProvider]`, and no extra song or image sources (songs are imported files, images come from Photos). A server type would conform to these protocols and go first in the lists.
 - A self-hosted LRCLIB needs no new code: it's an `LRCLIBProvider` with a different `baseURL`.
-- Nothing calls a server yet, and there are no settings for one.
+- The media server (see Media Server above) now downloads songs into the library; `LocalServerSongSource` is its `SongSource`. Lyrics and artist images still come from the song file, LRCLIB and Photos.
 
 ### Playback reliability (shuffle fixes)
 Tested against a real 1,587-song library on an iPhone (about 70% 44.1 kHz, 30% 48 kHz files):
@@ -308,7 +329,7 @@ Go to Settings → **Theme**.
 | `Debug/` | Debug-only tools: `AudioFixtures` (generated test audio and covers), `DemoLibrary`, `LibraryDiagnostics` |
 | `Playback/` | `PlayerEngine` (AVAudioEngine + EQ, recovery), `QueueManager`, `SpectrumAnalyzer`, `NowPlayingBridge` (lock screen), `MusicPlayer` (ties it all together), `PlaybackIssues` (problem log) |
 | `Lyrics/` | `Lyrics` (model, LRC parsing, current line), `LyricsProviders` (song file, LRCLIB, demo), `LyricsStore` (lookup chain, cache, missing list, Download All) |
-| `Sources/` | `MediaSources`: protocols for where lyrics, songs and artist images come from (groundwork for a local server) |
+| `Sources/` | `MediaSources` (protocols for where lyrics, songs and artist images come from), `MediaServerClient` (the media server's API, resumable downloads, `LocalServerSongSource`), `ServerSync` (downloading new music into the library), `Keychain` (`ServerTokenStore`, the device token) |
 | `Stats/` | `ListeningRules`, `StatsRecorder`, `StatsSummary` / `StatsCalendar`, `ListeningTotals` (per song/artist/genre totals for the Library's listening sorts) |
 | `Theme/` | `ThemePalette` (colors + Auto rules), `ThemeStore` (theme colors plus the glow and accent colors), `ArtworkPalette` (glow colors from the playing cover, Match Artwork) |
 | `UI/` | Root tabs, Home, library screens (Songs, Albums, Artists, Genres, Playlists, Search), Now Playing (with its lyrics, queue and equalizer pages), stats, Settings (with Lyrics and Missing Lyrics) and theme editor |
@@ -319,10 +340,12 @@ Go to Settings → **Theme**.
 | --- | --- |
 | `Documents/Music/` | Imported audio, plus folder images copied with it |
 | `Application Support/Art/` | Covers and artist pictures, in full, thumbnail and blurred versions |
+| `Documents/Music/Hi-Res/` | Songs from the media server's High-Res library (regular server music goes straight into `Documents/Music/`) |
+| Keychain | The media server device token (only there) |
 | `Application Support/Lyrics/` | One JSON file per song with its looked-up lyrics (or "instrumental" / "none" and when) |
 | `Application Support/lyrics-missing.json` | The songs whose lookup found no lyrics |
 | SwiftData store | Library (including Album Artist and each song's audio format), favorites, playlists, per-song EQ, listening history, saved themes, hidden artists, artist images and their background settings (separate player and page framing), manual group links (`ArtistGroupLink`) |
-| `UserDefaults` | Active theme (including Glass Opacity and Match Artwork), global EQ, sort orders (Songs, Artists, Genres), Lossless Only, the duplicate choice (Copy to Keep), last Library section, Show Album Cover, playback problem log |
+| `UserDefaults` | Active theme (including Glass Opacity and Match Artwork), global EQ, sort orders (Songs, Artists, Genres), Lossless Only, the duplicate choice (Copy to Keep), the media server address, its sync cursor per library, which libraries to sync and Sync When Sun Opens, last Library section, Show Album Cover, playback problem log |
 
 ## Tests
 The `Music AppTests` target (Swift Testing) covers:
@@ -348,6 +371,7 @@ The `Music AppTests` target (Swift Testing) covers:
 - the artist index: features on both artists in the right album, group albums and members, guests who aren't members, compilations, manual groups
 - crop geometry: the photo always covers the frame, and each framing keeps its shape (Whole Picture the image's own, Screen the phone's, Square)
 - transparent artist pictures keep their transparency (stored as PNG, own shape kept), opaque ones are stored as before
+- media server (against a pretend server with a made-up token, no network): songs finished before a sync stops are kept in the library while the cursor stays put; leftover downloads are added but `.part` files aren't; addresses normalized; a two-page sync downloads only the songs (not other files or deleted items) into the right folders, adds them with their server id and key, saves the cursor, sends the token on every request and skips book libraries; a second sync downloads nothing; an interrupted download resumes with a Range request (206 appends, 200 starts over); a rejected token or a closed server stops without moving the cursor; libraries on an unplugged drive are skipped; the token is kept in the Keychain
 - audio formats: generated uncompressed and AAC files are read as lossless/lossy with their sample rate, bit depth and bitrate; Core Audio codec and bit-depth mapping; songs not yet read judged by extension; Lossless Only
 - duplicates: the lossless copy stays by default; lengths must be within 3 s and the artist must match; Best Quality prefers hi-res, then bitrate; unknown lengths never match; hidden copies leave lists and artist pages but play when tapped in a playlist
 - lyrics: LRC parsing (several time tags, offset, both fraction formats, metadata skipped), synced vs plain, the current line with its lead, feat. parts left out; LRCLIB best match (±5 s, synced first) and responses from a stubbed network (cached answer first; a busy full lookup falls back to search and isn't certain; instrumental); the store with a fake provider (missing list rules, errors not kept, answers kept across launches, "none" checked again after a week, Download All counts and Search Again only re-checking missing songs)

@@ -33,6 +33,10 @@ final class Track {
     var bitDepth: Int?
     /// Average bitrate in kbps (file size ÷ length).
     var bitRate: Int?
+    /// For songs downloaded from the media server: the server's item id, and its key
+    /// ("library:rel_path"), the song's identity across devices (for syncing stats later).
+    var serverID: String?
+    var serverKey: String?
 
     init(
         relativePath: String,
